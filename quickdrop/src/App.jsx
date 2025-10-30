@@ -21,16 +21,12 @@ import {
 } from 'firebase/storage';
 
 // --- Firebase Configuration ---
-// These global variables are provided by the environment.
-const firebaseConfig = typeof __firebase_config !== 'undefined' 
-  ? JSON.parse(__firebase_config) 
+// Read config from Vite environment variables (.env.local)
+const firebaseConfig = import.meta.env.VITE_FIREBASE_CONFIG_JSON 
+  ? JSON.parse(import.meta.env.VITE_FIREBASE_CONFIG_JSON)
   : {};
-const appId = typeof __app_id !== 'undefined' 
-  ? __app_id 
-  : 'default-app-id';
-const initialAuthToken = typeof __initial_auth_token !== 'undefined' 
-  ? __initial_auth_token 
-  : null;
+const appId = import.meta.env.VITE_APP_ID || 'default-app-id';
+const initialAuthToken = import.meta.env.VITE_INITIAL_AUTH_TOKEN || null;
 
 // --- Helper Functions ---
 /**
