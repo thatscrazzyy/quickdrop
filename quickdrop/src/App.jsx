@@ -1,48 +1,12 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+// quickdrop/src/App.jsx
 
-// Firebase imports (as per instructions)
-import { initializeApp } from 'firebase/app';
-import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
-import { 
-  getFirestore, 
-  doc, 
-  onSnapshot, 
-  serverTimestamp,
-  setLogLevel,
-  collection,
-  addDoc,
-  query
-} from 'firebase/firestore';
-import {
-  getStorage,
-  ref,
-  uploadBytesResumable,
-  getDownloadURL
-} from 'firebase/storage';
+import React, { useState, useCallback, useEffect } from 'react';
 
-// --- Firebase Configuration ---
-// Read config from Vite environment variables (.env.local)
-const firebaseConfig = import.meta.env.VITE_FIREBASE_CONFIG_JSON 
-  ? JSON.parse(import.meta.env.VITE_FIREBASE_CONFIG_JSON)
-  : {};
-const appId = import.meta.env.VITE_APP_ID || 'default-app-id';
-const initialAuthToken = import.meta.env.VITE_INITIAL_AUTH_TOKEN || null;
+// --- Configuration ---
+// This is your local API server. When you deploy, change this.
+const API_BASE_URL = 'http://localhost:8080';
 
 // --- Helper Functions ---
-/**
- * Generates a user-friendly 3-word random ID.
- */
-const generateFriendlyId = () => {
-  const adjectives = ['swift', 'quick', 'fast', 'red', 'blue', 'green', 'cold', 'hot', 'dark', 'light', 'big', 'tiny'];
-  const nouns = ['fox', 'cat', 'dog', 'bird', 'sky', 'sea', 'rock', 'tree', 'sun', 'moon', 'star', 'leaf'];
-  const numbers = Math.floor(Math.random() * 90) + 10; // 10-99
-
-  const adj = adjectives[Math.floor(Math.random() * adjectives.length)];
-  const noun = nouns[Math.floor(Math.random() * nouns.length)];
-  
-  return `${adj}-${noun}-${numbers}`;
-};
-
 /**
  * Formats file size in bytes to a human-readable string.
  */
@@ -55,123 +19,128 @@ const formatBytes = (bytes, decimals = 2) => {
   return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
 };
 
+/**
+ * Uses XMLHttpRequest to upload a file to a signed URL
+ * while providing progress updates. This is better than fetch()
+ * for an "upload manager" as it gives progress.
+ */
+const uploadFileWithProgress = (file, uploadUrl, onProgress) => {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('PUT', uploadUrl, true);
+    xhr.setRequestHeader('Content-Type', file.type);
+
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable) {
+        const progress = (event.loaded / event.total) * 100;
+        onProgress(progress);
+      }
+    };
+
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(xhr.response);
+      } else {
+        reject(new Error(`Upload failed with status: ${xhr.status}`));
+      }
+    };
+
+    xhr.onerror = () => {
+      reject(new Error('Upload failed due to network error.'));
+    };
+
+    xhr.send(file);
+  });
+};
+
 // --- React App Component ---
 export default function App() {
-  // Firebase state
-  const [db, setDb] = useState(null);
-  const [auth, setAuth] = useState(null);
-  const [storage, setStorage] = useState(null);
-  const [userId, setUserId] = useState(null);
-  const [isLoading, setIsLoading] = useState(true);
-  
   // App state
   const [sessionId, setSessionId] = useState(null);
   const [joinInput, setJoinInput] = useState('');
-  const [files, setFiles] = useState([]); // List of files in the session
+  const [files, setFiles] = useState([]); // Holds the file list
   const [uploadingFiles, setUploadingFiles] = useState({}); // { [fileName]: progress }
   const [appError, setAppError] = useState(null);
+  const [isLoading, setIsLoading] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
 
-  // 1. Initialize Firebase and Authenticate User
+  // --- Sprint 2: Real-Time Event Listener ---
   useEffect(() => {
-    try {
-      if (Object.keys(firebaseConfig).length === 0) {
-        console.error("Firebase config is empty.");
-        setAppError("App is not configured. Please check console.");
-        setIsLoading(false);
-        return;
-      }
-
-      setLogLevel('Debug');
-      const app = initializeApp(firebaseConfig);
-      const authInstance = getAuth(app);
-      const dbInstance = getFirestore(app);
-      const storageInstance = getStorage(app); // Initialize Storage
-      
-      setDb(dbInstance);
-      setAuth(authInstance);
-      setStorage(storageInstance);
-
-      // Auth state listener
-      const unsubscribe = onAuthStateChanged(authInstance, async (user) => {
-        if (user) {
-          setUserId(user.uid);
-          setIsLoading(false);
-          console.log("User is signed in with UID:", user.uid);
-        } else {
-          console.log("No user found, attempting sign-in...");
-          try {
-            if (initialAuthToken) {
-              await signInWithCustomToken(authInstance, initialAuthToken);
-            } else {
-              await signInAnonymously(authInstance);
-            }
-          } catch (authError) {
-            console.error("Error during sign-in:", authError);
-            setAppError("Authentication failed. Please refresh.");
-            setIsLoading(false);
-          }
-        }
-      });
-
-      return () => unsubscribe();
-      
-    } catch (error) {
-      console.error("Firebase initialization error:", error);
-      setAppError("Failed to initialize app. Check console.");
-      setIsLoading(false);
-    }
-  }, []);
-
-  // 2. Set up Firestore real-time listener for the file list
-  useEffect(() => {
-    if (!db || !userId || !sessionId) {
-      setFiles([]); // Clear files if no session
+    if (!sessionId) {
+      setFiles([]); // Clear files when not in a session
       return;
     }
 
-    // Path to the 'files' collection within a specific session
-    const filesColPath = `artifacts/${appId}/public/data/quickdrop-sessions/${sessionId}/files`;
-    const filesColRef = collection(db, filesColPath);
-    const q = query(filesColRef); // You could add orderBy here, but it requires an index
+    // 1. Subscribe to Server-Sent Events (SSE)
+    console.log(`Connecting to SSE for session: ${sessionId}`);
+    const eventSource = new EventSource(
+      `${API_BASE_URL}/api/sessions/${sessionId}/subscribe`
+    );
 
-    console.log(`Listening to collection: ${filesColPath}`);
-
-    const unsubscribe = onSnapshot(q, (querySnapshot) => {
-      const filesData = [];
-      querySnapshot.forEach((doc) => {
-        filesData.push({ id: doc.id, ...doc.data() });
-      });
-      // Sort by timestamp in JS to avoid needing a composite index
-      filesData.sort((a, b) => (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0));
-      setFiles(filesData);
-      console.log("Received file list from Firestore:", filesData);
-    }, (error) => {
-      console.error("Error in onSnapshot listener:", error);
-      setAppError("Connection error. Please check console.");
-    });
-
-    return () => {
-      console.log("Cleaning up listener for session:", sessionId);
-      unsubscribe();
+    // 2. Handle incoming messages
+    eventSource.onmessage = (event) => {
+      try {
+        const fileData = JSON.parse(event.data);
+        console.log('SSE message received:', fileData);
+        setFiles((prevFiles) => {
+          // Avoid adding duplicates
+          if (prevFiles.find(f => f.id === fileData.id)) {
+            return prevFiles;
+          }
+          // Add new file to top of list, sorted by time
+          const newList = [fileData, ...prevFiles];
+          newList.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+          return newList;
+        });
+      } catch (e) {
+        console.error("Failed to parse SSE message data", e)
+      }
     };
-  }, [db, userId, sessionId, appId]);
 
-  // 3. Handle creating a new session
-  const handleCreateSession = () => {
-    const newId = generateFriendlyId();
-    setSessionId(newId);
+    // 3. Handle errors
+    eventSource.onerror = (err) => {
+      console.error('EventSource error:', err);
+      setAppError('Connection to real-time server lost.');
+      eventSource.close();
+    };
+
+    // 4. Cleanup when component unmounts or sessionId changes
+    return () => {
+      console.log('Closing SSE connection.');
+      eventSource.close();
+    };
+  }, [sessionId]); // Re-run this effect whenever sessionId changes
+
+  // 1. Handle creating a new session
+  const handleCreateSession = async () => {
+    setIsLoading(true);
+    setAppError(null);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/create-session`, {
+        method: 'POST',
+      });
+      if (!response.ok) {
+        const err = await response.json();
+        throw new Error(err.message || 'Failed to create session on server.');
+      }
+      const data = await response.json();
+      setSessionId(data.sessionId);
+    } catch (error) {
+      console.error(error);
+      setAppError(error.message);
+    }
+    setIsLoading(false);
   };
 
-  // 4. Handle joining an existing session
+  // 2. Handle joining an existing session
   const handleJoinSession = (e) => {
     e.preventDefault();
     if (joinInput.trim()) {
-      setSessionId(joinInput.trim().toLowerCase());
+      setSessionId(joinInput.trim());
     }
   };
 
-  // 5. Handle leaving a session
+  // 3. Handle leaving a session
   const handleLeaveSession = () => {
     setSessionId(null);
     setJoinInput('');
@@ -179,81 +148,106 @@ export default function App() {
     setUploadingFiles({});
   };
 
-  // 6. Handle file upload (from drop or input)
-  const handleFileUpload = useCallback((droppedFiles) => {
-    if (!storage || !db || !sessionId || !userId) {
-      setAppError("Not connected. Cannot upload files.");
+  // 4. Handle file upload (from drop or input)
+  const handleFileUpload = useCallback(async (droppedFiles) => {
+    if (!sessionId) {
+      setAppError("Not in a session. Cannot upload files.");
       return;
     }
 
-    // Limit file size (e.g., 100MB as per your proposal)
-    const MAX_SIZE = 100 * 1024 * 1024;
+    const MAX_SIZE = 100 * 1024 * 1024; // 100MB
 
     for (const file of droppedFiles) {
+      const uniqueFileName = `${Date.now()}-${file.name}`;
+      
       if (file.size > MAX_SIZE) {
         setAppError(`File ${file.name} is too large (Max 100MB).`);
         continue;
       }
-      
-      const uniqueFileName = `${Date.now()}-${file.name}`;
-      // Use a public path for this demo
-      const storagePath = `artifacts/${appId}/public/quickdrop-files/${sessionId}/${uniqueFileName}`;
-      const storageRef = ref(storage, storagePath);
-      
-      const uploadTask = uploadBytesResumable(storageRef, file);
 
-      // Update uploading state
       setUploadingFiles(prev => ({ ...prev, [uniqueFileName]: 0 }));
 
-      uploadTask.on('state_changed',
-        (snapshot) => {
-          // Progress function
-          const progress = (snapshot.bytesTransferred / snapshot.totalBytes) * 100;
-          setUploadingFiles(prev => ({ ...prev, [uniqueFileName]: progress }));
-        },
-        (error) => {
-          // Error function
-          console.error("Upload error:", error);
-          setAppError(`Failed to upload ${file.name}.`);
-          setUploadingFiles(prev => {
-            const newState = { ...prev };
-            delete newState[uniqueFileName];
-            return newState;
-          });
-        },
-        async () => {
-          // Complete function
-          const downloadURL = await getDownloadURL(uploadTask.snapshot.ref);
-          
-          // Add file metadata to Firestore
-          const filesColPath = `artifacts/${appId}/public/data/quickdrop-sessions/${sessionId}/files`;
-          try {
-            await addDoc(collection(db, filesColPath), {
-              name: file.name,
-              size: file.size,
-              type: file.type,
-              url: downloadURL,
-              storagePath: storagePath,
-              uploaderId: userId,
-              createdAt: serverTimestamp()
-            });
-          } catch (error) {
-            console.error("Error writing file metadata to Firestore:", error);
-            setAppError("Upload complete, but failed to save file metadata.");
-          }
+      try {
+        // --- This is the Sprint 1 Upload Flow ---
+        
+        // 1. Ask our backend for a signed URL
+        const urlResponse = await fetch(`${API_BASE_URL}/api/get-upload-url`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            sessionId: sessionId,
+            fileName: file.name,
+            fileType: file.type,
+            fileSize: file.size,
+          }),
+        });
 
-          // Remove from uploading state
-          setUploadingFiles(prev => {
-            const newState = { ...prev };
-            delete newState[uniqueFileName];
-            return newState;
-          });
+        if (!urlResponse.ok) {
+          const err = await urlResponse.json();
+          throw new Error(err.message || 'Failed to get upload URL.');
         }
-      );
-    }
-  }, [storage, db, sessionId, userId, appId]);
 
-  // 7. Drag-and-drop event handlers
+        const { uploadUrl } = await urlResponse.json();
+
+        // 2. Upload the file directly to GCS using the signed URL
+        await uploadFileWithProgress(file, uploadUrl, (progress) => {
+          setUploadingFiles(prev => ({ ...prev, [uniqueFileName]: progress }));
+        });
+
+        // 3. Upload is complete!
+        console.log(`Upload complete: ${file.name}`);
+        
+        // Remove from uploading state
+        // We add a small delay so the 100% bar is visible
+        setTimeout(() => {
+          setUploadingFiles(prev => {
+            const newState = { ...prev };
+            delete newState[uniqueFileName];
+            return newState;
+          });
+        }, 500);
+        
+        // ** NOTE **
+        // The Cloud Function is now processing this file.
+        // Our SSE listener will pick up the "file-ready" event
+        // and add the file to the list.
+
+      } catch (error) {
+        console.error("Upload error:", error);
+        setAppError(`Failed to upload ${file.name}: ${error.message}`);
+        setUploadingFiles(prev => {
+          const newState = { ...prev };
+          delete newState[uniqueFileName];
+          return newState;
+        });
+      }
+    }
+  }, [sessionId]);
+
+  // --- Sprint 2: Download Handler ---
+  const handleDownload = async (file) => {
+    try {
+      // 1. Ask our backend for a temporary download link
+      const response = await fetch(
+        `${API_BASE_URL}/api/get-download-url?storagePath=${file.storagePath}`
+      );
+      if (!response.ok) {
+        const err = await response.json();
+        throw new Error(err.message || 'Could not get download link.');
+      }
+      const { downloadUrl } = await response.json();
+
+      // 2. Open the link to trigger download
+      window.open(downloadUrl, '_blank');
+
+    } catch (error) {
+      console.error('Download error:', error);
+      setAppError(error.message);
+    }
+  };
+
+
+  // 5. Drag-and-drop event handlers
   const handleDragOver = (e) => {
     e.preventDefault();
     setIsDragging(true);
@@ -276,7 +270,7 @@ export default function App() {
   if (isLoading) {
     return (
       <div className="flex items-center justify-center min-h-screen bg-gray-900 text-white">
-        <div className="text-2xl font-semibold">Initializing QuickDrop...</div>
+        <div className="text-2xl font-semibold">Loading...</div>
       </div>
     );
   }
@@ -288,10 +282,10 @@ export default function App() {
           <h2 className="text-2xl font-bold mb-4">An Error Occurred</h2>
           <p className="text-red-100">{appError}</p>
           <button
-            onClick={() => setAppError(null)} // Clear error
+            onClick={() => { setAppError(null); handleLeaveSession(); }}
             className="mt-6 px-4 py-2 bg-red-600 hover:bg-red-500 rounded-md font-semibold text-white shadow-lg transition-all"
           >
-            Dismiss
+            Go Home
           </button>
         </div>
       </div>
@@ -331,8 +325,8 @@ export default function App() {
               <input
                 type="text"
                 value={joinInput}
-                onChange={(e) => setJoinInput(e.target.value.toLowerCase())}
-                placeholder="Enter session code (e.g. swift-fox-12)"
+                onChange={(e) => setJoinInput(e.target.value)}
+                placeholder="Enter 6-digit code"
                 className="w-full px-4 py-3 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-cyan-500"
                 aria-label="Session code"
               />
@@ -389,7 +383,7 @@ export default function App() {
                 {uploadingList.map(([name, progress]) => (
                   <div key={name}>
                     <div className="flex justify-between text-sm text-gray-300 mb-1">
-                      <span>{name}</span>
+                      <span className="truncate w-11/12">{name.split('-').slice(1).join('-')}</span>
                       <span>{Math.round(progress)}%</span>
                     </div>
                     <div className="w-full bg-gray-600 rounded-full h-2.5">
@@ -405,24 +399,23 @@ export default function App() {
           <div className="flex-grow mt-6">
             <h3 className="text-xl font-semibold mb-4 text-gray-300">Shared Files</h3>
             <div className="space-y-3">
-              {files.length === 0 && (
-                <p className="text-gray-500 text-center py-4">No files shared in this session yet.</p>
+              {files.length === 0 && uploadingList.length === 0 && (
+                <p className="text-gray-500 text-center py-4">
+                  No files shared in this session yet. Upload one!
+                </p>
               )}
               {files.map(file => (
                 <div key={file.id} className="flex items-center justify-between p-4 bg-gray-800 rounded-lg border border-gray-700">
                   <div>
-                    <p className="text-lg font-medium text-cyan-300">{file.name}</p>
+                    <p className="text-lg font-medium text-cyan-300 truncate w-60 sm:w-full">{file.name}</p>
                     <p className="text-sm text-gray-400">{formatBytes(file.size)} - {file.type}</p>
                   </div>
-                  <a
-                    href={file.url}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    download={file.name}
-                    className="px-4 py-2 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-lg shadow-md transition-colors text-sm"
+                  <button
+                    onClick={() => handleDownload(file)}
+                    className="px-4 py-2 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-lg shadow-md transition-colors text-sm ml-2"
                   >
                     Download
-                  </a>
+                  </button>
                 </div>
               ))}
             </div>
@@ -430,12 +423,6 @@ export default function App() {
           
         </div>
       )}
-      
-      {/* Footer with User ID */}
-      <footer className="w-full max-w-5xl mx-auto mt-8 text-center text-gray-500 text-xs">
-        <p>Your User ID: <span className="font-mono">{userId || '...'}</span></p>
-      </footer>
     </div>
   );
 }
-
