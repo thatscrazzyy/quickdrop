@@ -22,7 +22,7 @@ const TOPIC_NAME = 'file-ready'; // The topic you created
 exports.updateFileMetadata = async (event) => {
   console.log('File event received:', JSON.stringify(event));
 
-  const file = event.data;
+  const file = event;
   if (!file || !file.name) {
     console.warn('No file data in event.');
     return;

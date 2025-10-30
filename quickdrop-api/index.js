@@ -110,6 +110,9 @@ app.post('/api/get-upload-url', async (req, res) => {
   }
 });
 
+app.get('/api/sessions/:sessionId/subscribe', async (req, res) => {
+  const { sessionId } = req.params;
+  console.log(`Client connected for SSE on session: ${sessionId}`);
 // 1. Set SSE headers
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
@@ -127,7 +130,7 @@ app.post('/api/get-upload-url', async (req, res) => {
     messageRetentionDuration: 600, // 10 minutes
     expirationPolicy: {
       ttl: {
-        seconds: 600, // 10 minutes
+        seconds: 86400, // 10 minutes
       },
     },
   };
@@ -162,6 +165,7 @@ app.post('/api/get-upload-url', async (req, res) => {
       console.error(`Failed to delete subscription ${subscriptionName}:`, err);
     });
     res.end();
+  });
   });
 // --- Start Server ---
 app.listen(PORT, () => {
