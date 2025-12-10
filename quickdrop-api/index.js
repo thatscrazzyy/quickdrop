@@ -15,21 +15,10 @@ const PUB_SUB_TOPIC_NAME = 'file-ready';
 // --- Initialize Admin SDKs ---
 // We use a service account key for local testing.
 // In Cloud Run, it will *automatically* use the runtime service account.
-const firestore = new Firestore({
-  keyFilename: './service-account-key.json',
-  projectId: 'quickdrop-9a015',
-});
-
-const storage = new Storage({
-  keyFilename: './service-account-key.json',
-  projectId: 'quickdrop-9a015',
-});
+const firestore = new Firestore();
+const storage = new Storage();
 const bucket = storage.bucket(BUCKET_NAME);
-
-const pubsub = new PubSub({
-  keyFilename: './service-account-key.json',
-  projectId: 'quickdrop-9a015',
-});
+const pubsub = new PubSub();
 
 // --- Middleware ---
 app.use(cors()); // Allow cross-origin requests
@@ -105,8 +94,49 @@ app.post('/api/get-upload-url', async (req, res) => {
     const [uploadUrl] = await file.getSignedUrl(options);
     res.status(200).json({ uploadUrl, storagePath });
   } catch (error) {
-    console.error('Error generating signed URL:', error);
-    res.status(500).send({ message: 'Failed to generate upload URL.' });
+  console.error('Error generating signed URL:', {
+    message: error.message,
+    code: error.code,
+    errors: error.errors,
+    stack: error.stack,
+  });
+  res.status(500).send({ message: 'Failed to generate upload URL.' });
+}
+
+});
+
+app.get('/api/get-download-url', async (req, res) => {
+  try {
+    const { storagePath } = req.query;
+
+    if (!storagePath) {
+      return res
+        .status(400)
+        .json({ message: 'Missing required query parameter: storagePath' });
+    }
+
+    // storagePath is something like: quickdrop-files/{sessionId}/{filename}
+    const file = bucket.file(storagePath.toString());
+
+    // (Optional but nice) Check that file exists
+    const [exists] = await file.exists();
+    if (!exists) {
+      return res.status(404).json({ message: 'File not found.' });
+    }
+
+    // Create a signed URL that allows READ access for 15 minutes
+    const [downloadUrl] = await file.getSignedUrl({
+      version: 'v4',
+      action: 'read',
+      expires: Date.now() + 15 * 60 * 1000,
+    });
+
+    return res.status(200).json({ downloadUrl });
+  } catch (error) {
+    console.error('Error generating download URL:', error);
+    return res
+      .status(500)
+      .json({ message: 'Failed to generate download URL.' });
   }
 });
 
@@ -167,6 +197,43 @@ app.get('/api/sessions/:sessionId/subscribe', async (req, res) => {
     res.end();
   });
   });
+
+app.get('/api/sessions/:sessionId/files', async (req, res) => {
+  const { sessionId } = req.params;
+
+  try {
+    // Make sure the session exists
+    const sessionRef = firestore.collection('quickdrop-sessions').doc(sessionId);
+    const sessionSnap = await sessionRef.get();
+    if (!sessionSnap.exists) {
+      return res.status(404).json({ message: 'Session not found.' });
+    }
+
+    // Load files subcollection, newest first
+    const filesSnap = await sessionRef
+      .collection('files')
+      .orderBy('createdAt', 'desc')
+      .get();
+
+    const files = filesSnap.docs.map((doc) => {
+      const data = doc.data();
+      return {
+        id: doc.id,
+        ...data,
+        // Firestore Timestamp -> ISO string for the React `new Date(...)` calls
+        createdAt: data.createdAt?.toDate
+          ? data.createdAt.toDate().toISOString()
+          : data.createdAt,
+      };
+    });
+
+    res.json({ files });
+  } catch (err) {
+    console.error('Error fetching session files:', err);
+    res.status(500).json({ message: 'Failed to load session files.' });
+  }
+});
+
 // --- Start Server ---
 app.listen(PORT, () => {
   console.log(`QuickDrop API server listening on port ${PORT}`);

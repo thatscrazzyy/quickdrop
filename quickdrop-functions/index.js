@@ -1,47 +1,53 @@
-// quickdrop-functions/index.js
-// --- CONVERTED TO COMMONJS SYNTAX ---
+const { Storage } = require("@google-cloud/storage");
+const { Firestore } = require("@google-cloud/firestore");
+const { PubSub } = require("@google-cloud/pubsub");
 
-const { getFirestore } = require('firebase-admin/firestore');
-const { PubSub } = require('@google-cloud/pubsub');
-const { initializeApp, getApps } = require('firebase-admin/app');
-
-// Initialize Admin SDK
-if (getApps().length === 0) {
-  initializeApp();
-}
-
-const db = getFirestore();
+const storage = new Storage();
+const firestore = new Firestore();
 const pubsub = new PubSub();
-const TOPIC_NAME = 'file-ready'; // The topic you created
 
-/**
- * Eventarc trigger for new files in Cloud Storage.
- * Triggered by 'google.cloud.storage.object.v1.finalized'
- */
-// --- USE EXPORTS.FUNCTION_NAME ---
+const BUCKET_NAME = "quickdrop-9a015.firebasestorage.app"; // make sure this matches
+const TOPIC_NAME = "file-ready";
+
 exports.updateFileMetadata = async (event) => {
-  console.log('File event received:', JSON.stringify(event));
+  console.log("=== updateFileMetadata triggered ===");
+  console.log("Raw event:", JSON.stringify(event));
 
-  const file = event;
-  if (!file || !file.name) {
-    console.warn('No file data in event.');
+  const bucket = event.bucket;
+  const name = event.name;
+  const size = event.size;
+  const contentType = event.contentType;
+  const timeCreated = event.timeCreated;
+
+  console.log("Bucket:", bucket);
+  console.log("Name:", name);
+  console.log("Size:", size, "Type:", contentType);
+
+  // 1) Make sure this is the right bucket
+  if (bucket !== BUCKET_NAME) {
+    console.log(`Skipping object from bucket ${bucket}, expected ${BUCKET_NAME}`);
     return;
   }
 
-  const { name, bucket, size, contentType, timeCreated } = file;
-
-  // 1. Extract info from the file path
-  // Path is "quickdrop-files/{sessionId}/{fileName}"
-  const pathParts = name.split('/');
-  if (pathParts[0] !== 'quickdrop-files' || pathParts.length < 3) {
-    console.warn(`File path ${name} is not a quickdrop file. Skipping.`);
+  // 2) Expect paths like quickdrop-files/{sessionId}/{fileName}
+  if (!name.startsWith("quickdrop-files/")) {
+    console.log("Skipping object not under quickdrop-files/:", name);
     return;
   }
-  
-  const sessionId = pathParts[1];
-  const originalFileName = pathParts.slice(2).join('/'); // In case filename had '/'
 
-  // 2. Create the metadata object
+  const parts = name.split("/");
+  if (parts.length < 3) {
+    console.log("Skipping object with unexpected path structure:", name);
+    return;
+  }
+
+  const sessionId = parts[1];
+  const originalFileName = parts.slice(2).join("/");
+
+  console.log("Derived sessionId:", sessionId);
+  console.log("Original file name:", originalFileName);
+
+  // 3) Build file metadata
   const fileMetadata = {
     name: originalFileName,
     storagePath: name,
@@ -49,28 +55,29 @@ exports.updateFileMetadata = async (event) => {
     type: contentType,
     createdAt: new Date(timeCreated),
   };
-  
-  console.log(`Writing metadata for session ${sessionId}:`, fileMetadata);
 
-  try {
-    // 3. Write metadata to Firestore
-    const filesCol = db.collection(`quickdrop-sessions/${sessionId}/files`);
-    const fileDocRef = await filesCol.add(fileMetadata);
-    console.log(`Wrote to Firestore, doc ID: ${fileDocRef.id}`);
+  // 4) Write to Firestore subcollection
+  const fileDocRef = await firestore
+    .collection("quickdrop-sessions")
+    .doc(sessionId)
+    .collection("files")
+    .add(fileMetadata);
 
-    // 4. Publish "file-ready" event to Pub/Sub
-    const messageData = {
-      sessionId: sessionId,
-      ...fileMetadata, // Send the full file object
-      id: fileDocRef.id, // Include the new Firestore document ID
-    };
-    
-    await pubsub.topic(TOPIC_NAME).publishMessage({
-      json: messageData,
-    });
-    console.log(`Published to ${TOPIC_NAME}:`, messageData);
+  console.log("Wrote Firestore doc:", fileDocRef.path);
 
-  } catch (error) {
-    console.error('Failed to process file event:', error);
-  }
+  // 5) Publish Pub/Sub message WITH sessionId attribute
+  const messageData = {
+    sessionId: sessionId,
+    ...fileMetadata,
+    id: fileDocRef.id,
+  };
+
+  await pubsub.topic(TOPIC_NAME).publishMessage({
+    json: messageData,
+    attributes: {
+      sessionId: sessionId, // must match filter in API
+    },
+  });
+
+  console.log(`Published to ${TOPIC_NAME}:`, messageData);
 };

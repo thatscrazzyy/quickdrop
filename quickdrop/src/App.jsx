@@ -4,7 +4,10 @@ import React, { useState, useCallback, useEffect } from 'react';
 
 // --- Configuration ---
 // This is your local API server. When you deploy, change this.
-const API_BASE_URL = 'http://localhost:8080';
+const API_BASE_URL =
+  import.meta.env.VITE_API_BASE_URL || 'http://localhost:8080';
+
+
 
 // --- Helper Functions ---
 /**
@@ -64,12 +67,57 @@ export default function App() {
   const [isLoading, setIsLoading] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
 
+  // On first load, auto-join if ?session=CODE is present in URL
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+
+    const params = new URLSearchParams(window.location.search);
+    const urlSession = params.get('session');
+
+    if (urlSession && !sessionId) {
+      setSessionId(urlSession.trim());
+      setJoinInput(urlSession.trim());
+    }
+  }, []); // run once on mount
+
   // --- Sprint 2: Real-Time Event Listener ---
   useEffect(() => {
     if (!sessionId) {
       setFiles([]); // Clear files when not in a session
       return;
     }
+
+    const loadExistingFiles = async () => {
+      try {
+        const resp = await fetch(
+          `${API_BASE_URL}/api/sessions/${sessionId}/files`
+        );
+        if (!resp.ok) {
+          console.error('Failed to load existing files');
+          return;
+        }
+        const data = await resp.json();
+        setFiles(prev => {
+          const combined = [...data.files, ...prev];
+          const seen = new Set();
+          const deduped = [];
+          for (const f of combined) {
+            if (!seen.has(f.id)) {
+              seen.add(f.id);
+              deduped.push(f);
+            }
+          }
+          deduped.sort(
+            (a, b) => new Date(b.createdAt) - new Date(a.createdAt)
+          );
+          return deduped;
+        });
+      } catch (e) {
+        console.error('Error loading existing files:', e);
+      }
+    };
+
+    loadExistingFiles();
 
     // 1. Subscribe to Server-Sent Events (SSE)
     console.log(`Connecting to SSE for session: ${sessionId}`);
@@ -110,6 +158,21 @@ export default function App() {
       eventSource.close();
     };
   }, [sessionId]); // Re-run this effect whenever sessionId changes
+
+  // Keep session code in URL so you can share / scan it
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+
+    const url = new URL(window.location.href);
+
+    if (sessionId) {
+      url.searchParams.set('session', sessionId);
+    } else {
+      url.searchParams.delete('session');
+    }
+
+    window.history.replaceState({}, '', url);
+  }, [sessionId]);
 
   // 1. Handle creating a new session
   const handleCreateSession = async () => {
@@ -225,26 +288,37 @@ export default function App() {
   }, [sessionId]);
 
   // --- Sprint 2: Download Handler ---
+  // --- Sprint 2: Download Handler ---
   const handleDownload = async (file) => {
     try {
-      // 1. Ask our backend for a temporary download link
+      // 1. Ask backend for a temporary download link
       const response = await fetch(
-        `${API_BASE_URL}/api/get-download-url?storagePath=${file.storagePath}`
+        `${API_BASE_URL}/api/get-download-url?storagePath=${encodeURIComponent(
+          file.storagePath
+        )}`
       );
+
       if (!response.ok) {
-        const err = await response.json();
+        const err = await response.json().catch(() => ({}));
         throw new Error(err.message || 'Could not get download link.');
       }
+
       const { downloadUrl } = await response.json();
 
-      // 2. Open the link to trigger download
-      window.open(downloadUrl, '_blank');
-
+      // 2. Force a download instead of trying to “open” it
+      const link = document.createElement('a');
+      link.href = downloadUrl;
+      link.download = file.name || 'download';
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
     } catch (error) {
       console.error('Download error:', error);
-      setAppError(error.message);
+      setAppError(`Failed to download ${file.name}: ${error.message}`);
     }
   };
+
+
 
 
   // 5. Drag-and-drop event handlers
@@ -264,7 +338,10 @@ export default function App() {
       e.dataTransfer.clearData();
     }
   };
-  
+
+  const sessionUrl = sessionId
+    ? `${window.location.origin}?session=${encodeURIComponent(sessionId)}`
+    : '';
   // --- Render Logic ---
 
   if (isLoading) {
@@ -341,19 +418,45 @@ export default function App() {
         </div>
       ) : (
         // --- File Share View ---
-        <div className="flex-grow flex flex-col w-full max-w-5xl mx-auto">
-          <div className="flex flex-col sm:flex-row justify-between items-center mb-4 p-4 bg-gray-800 rounded-lg border border-gray-700">
-            <div className="mb-2 sm:mb-0">
-              <span className="text-gray-400">Session Code: </span>
-              <strong className="text-lg text-cyan-400 font-mono">{sessionId}</strong>
-            </div>
-            <button
-              onClick={handleLeaveSession}
-              className="px-4 py-2 bg-red-600 hover:bg-red-500 text-white font-semibold rounded-lg shadow-md transition-colors text-sm"
-            >
-              Leave Session
-            </button>
-          </div>
+          <div className="flex-grow flex flex-col w-full max-w-5xl mx-auto">
+            <div className="flex flex-col sm:flex-row justify-between sm:items-center mb-4 p-4 bg-gray-800 rounded-lg border border-gray-700">
+              <div className="mb-4 sm:mb-0">
+                <span className="text-gray-400">Session Code: </span>
+                <strong className="text-lg text-cyan-400 font-mono">{sessionId}</strong>
+                {sessionUrl && (
+                    <p className="text-xs text-gray-500 mt-1 break-all">
+                      Link: {sessionUrl}
+                    </p>
+                  )}
+                </div>
+
+                <div className="flex items-center gap-4">
+                  {sessionUrl && (
+                    <div className="flex flex-col items-center">
+                      <span className="text-xs text-gray-400 mb-1">
+                        Scan to join this session
+                      </span>
+                      <div className="bg-white p-2 rounded-lg">
+                        <img
+                          src={`https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=${encodeURIComponent(
+                            sessionUrl
+                          )}`}
+                          alt="Session QR code"
+                          className="w-24 h-24"
+                        />
+                      </div>
+                    </div>
+                  )}
+
+                  <button
+                    onClick={handleLeaveSession}
+                    className="px-4 py-2 bg-red-600 hover:bg-red-500 text-white font-semibold rounded-lg shadow-md transition-colors text-sm"
+                  >
+                    Leave Session
+                  </button>
+                </div>
+              </div>
+
           
           {/* --- Drop Zone --- */}
           <div
