@@ -6,163 +6,132 @@ import { Storage } from '@google-cloud/storage';
 import cors from 'cors';
 import { PubSub } from '@google-cloud/pubsub';
 
-// --- Configuration ---
 const app = express();
 const PORT = process.env.PORT || 8080;
-const BUCKET_NAME = 'quickdrop-9a015.firebasestorage.app'; 
-const MAX_FILE_SIZE_MB = 100; // Max file size limit is 100 MB
+const BUCKET_NAME = 'quickdrop-9a015.firebasestorage.app';
+const MAX_FILE_SIZE_MB = 100;
 const PUB_SUB_TOPIC_NAME = 'file-ready';
-// --- Initialize Admin SDKs ---
-// We use a service account key for local testing.
-// In Cloud Run, it will *automatically* use the runtime service account.
+
 const firestore = new Firestore();
 const storage = new Storage();
 const bucket = storage.bucket(BUCKET_NAME);
 const pubsub = new PubSub();
 
-// --- Middleware ---
-app.use(cors()); // Allow cross-origin requests
-app.use(express.json()); // Parse JSON request bodies
+app.use(cors());
+app.use(express.json());
 
-// --- Helper Functions ---
-/**
- * Generates a 6-digit numeric code. [cite: 31, 43]
- */
-const generateSessionCode = () => {
-  return Math.floor(100000 + Math.random() * 900000).toString();
+const generateSessionCode = () =>
+  Math.floor(100000 + Math.random() * 900000).toString();
+
+const isSessionExpired = (data) => {
+  const exp = data.expiresAt?.toDate ? data.expiresAt.toDate() : new Date(data.expiresAt);
+  return new Date() > exp;
 };
 
-// --- API Endpoints ---
+// --- Endpoints ---
 
-/**
- */
-app.post('/api/create-session', async (req, res) => {
+app.post('/api/create-session', async (_req, res) => {
   try {
     const sessionId = generateSessionCode();
-    const sessionRef = firestore.collection('quickdrop-sessions').doc(sessionId);
-
-    // Store the session in Firestore [cite: 43]
-    await sessionRef.set({
+    const expiresAt = new Date(Date.now() + 60 * 60 * 1000);
+    await firestore.collection('quickdrop-sessions').doc(sessionId).set({
       createdAt: new Date(),
-      expiresAt: new Date(Date.now() + 60 * 60 * 1000), // 60 min TTL [cite: 37]
+      expiresAt,
       files: [],
     });
-
     console.log(`Session created: ${sessionId}`);
-    res.status(201).json({ sessionId });
-  } catch (error) {
-    console.error('Error creating session:', error);
-    res.status(500).send({ message: 'Failed to create session' });
+    res.status(201).json({ sessionId, expiresAt: expiresAt.toISOString() });
+  } catch (err) {
+    console.error('Error creating session:', err);
+    res.status(500).json({ message: 'Failed to create session.' });
   }
 });
 
-/**
- * [SPRINT 1] Gets a signed PUT URL for file upload. [cite: 33, 44]
- * Implements uploading logic. 
- */
+app.get('/api/sessions/:sessionId/validate', async (req, res) => {
+  const { sessionId } = req.params;
+  try {
+    const doc = await firestore.collection('quickdrop-sessions').doc(sessionId).get();
+    if (!doc.exists) return res.status(404).json({ message: 'Session not found.' });
+    const data = doc.data();
+    if (isSessionExpired(data)) return res.status(410).json({ message: 'Session has expired.' });
+    const expiresAt = data.expiresAt?.toDate
+      ? data.expiresAt.toDate().toISOString()
+      : data.expiresAt;
+    res.json({ sessionId, expiresAt });
+  } catch (err) {
+    console.error('Error validating session:', err);
+    res.status(500).json({ message: 'Failed to validate session.' });
+  }
+});
+
 app.post('/api/get-upload-url', async (req, res) => {
   const { sessionId, fileName, fileType, fileSize } = req.body;
 
   if (!sessionId || !fileName || !fileType || !fileSize) {
-    return res.status(400).send({ message: 'Missing required parameters.' });
+    return res.status(400).json({ message: 'Missing required parameters.' });
   }
-
-  // Enforce file size limit [cite: 43]
   if (fileSize > MAX_FILE_SIZE_MB * 1024 * 1024) {
-    return res.status(400).send({ message: `File exceeds ${MAX_FILE_SIZE_MB}MB limit.` });
+    return res.status(400).json({ message: `File exceeds ${MAX_FILE_SIZE_MB}MB limit.` });
   }
 
-  // Validate session exists
   const sessionDoc = await firestore.collection('quickdrop-sessions').doc(sessionId).get();
-  if (!sessionDoc.exists) {
-    return res.status(404).send({ message: 'Session not found.' });
-  }
-  
-  // Use per-session Storage prefix for security [cite: 47]
+  if (!sessionDoc.exists) return res.status(404).json({ message: 'Session not found.' });
+  if (isSessionExpired(sessionDoc.data())) return res.status(410).json({ message: 'Session has expired.' });
+
   const storagePath = `quickdrop-files/${sessionId}/${Date.now()}-${fileName}`;
   const file = bucket.file(storagePath);
-
-  // Configure the signed URL
   const options = {
     version: 'v4',
     action: 'write',
-    expires: Date.now() + 15 * 60 * 1000, // 15-minute expiry
+    expires: Date.now() + 15 * 60 * 1000,
     contentType: fileType,
   };
 
   try {
     const [uploadUrl] = await file.getSignedUrl(options);
     res.status(200).json({ uploadUrl, storagePath });
-  } catch (error) {
-  console.error('Error generating signed URL:', {
-    message: error.message,
-    code: error.code,
-    errors: error.errors,
-    stack: error.stack,
-  });
-  res.status(500).send({ message: 'Failed to generate upload URL.' });
-}
-
+  } catch (err) {
+    console.error('Error generating signed URL:', err);
+    res.status(500).json({ message: 'Failed to generate upload URL.' });
+  }
 });
 
 app.get('/api/get-download-url', async (req, res) => {
   try {
     const { storagePath } = req.query;
-
     if (!storagePath) {
-      return res
-        .status(400)
-        .json({ message: 'Missing required query parameter: storagePath' });
+      return res.status(400).json({ message: 'Missing storagePath.' });
     }
-
-    // storagePath is something like: quickdrop-files/{sessionId}/{filename}
     const file = bucket.file(storagePath.toString());
-
-    // (Optional but nice) Check that file exists
     const [exists] = await file.exists();
-    if (!exists) {
-      return res.status(404).json({ message: 'File not found.' });
-    }
+    if (!exists) return res.status(404).json({ message: 'File not found.' });
 
-    // Create a signed URL that allows READ access for 15 minutes
     const [downloadUrl] = await file.getSignedUrl({
       version: 'v4',
       action: 'read',
       expires: Date.now() + 15 * 60 * 1000,
     });
-
-    return res.status(200).json({ downloadUrl });
-  } catch (error) {
-    console.error('Error generating download URL:', error);
-    return res
-      .status(500)
-      .json({ message: 'Failed to generate download URL.' });
+    res.json({ downloadUrl });
+  } catch (err) {
+    console.error('Error generating download URL:', err);
+    res.status(500).json({ message: 'Failed to generate download URL.' });
   }
 });
 
 app.get('/api/sessions/:sessionId/subscribe', async (req, res) => {
   const { sessionId } = req.params;
-  console.log(`Client connected for SSE on session: ${sessionId}`);
-// 1. Set SSE headers
+  console.log(`SSE connect: ${sessionId}`);
+
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
   res.flushHeaders();
 
-  // 2. Create a unique, temporary Pub/Sub subscription
-  // This subscription will be auto-deleted after 10 minutes of inactivity.
   const subscriptionName = `session-sub-${sessionId}-${Date.now()}`;
   const subscriptionOptions = {
-    gaxOpts: {
-      deadline: 300000, // 5 minutes
-    },
-    filter: `attributes.sessionId = "${sessionId}"`, // <-- CRITICAL: Only get messages for this session
-    messageRetentionDuration: 600, // 10 minutes
-    expirationPolicy: {
-      ttl: {
-        seconds: 86400, // 10 minutes
-      },
-    },
+    filter: `attributes.sessionId = "${sessionId}"`,
+    messageRetentionDuration: 600,
+    expirationPolicy: { ttl: { seconds: 600 } },
   };
 
   let subscription;
@@ -170,63 +139,43 @@ app.get('/api/sessions/:sessionId/subscribe', async (req, res) => {
     [subscription] = await pubsub
       .topic(PUB_SUB_TOPIC_NAME)
       .createSubscription(subscriptionName, subscriptionOptions);
-    console.log(`Created subscription: ${subscriptionName}`);
-  } catch (error) {
-    console.error(`Failed to create subscription:`, error);
+  } catch (err) {
+    console.error('Failed to create subscription:', err);
     return res.status(500).end();
   }
 
-  // 3. Define the message handler
   const messageHandler = (message) => {
-    console.log(`Received message for ${sessionId}:`, message.data.toString());
-    // Send to client in SSE format: "data: {JSON_PAYLOAD}\n\n"
     res.write(`data: ${message.data.toString()}\n\n`);
-    message.ack(); // Acknowledge the message
+    message.ack();
   };
 
-  // 4. Listen for messages
   subscription.on('message', messageHandler);
 
-  // 5. Handle client disconnect
   req.on('close', () => {
-    console.log(`Client disconnected from SSE on session: ${sessionId}`);
     subscription.removeListener('message', messageHandler);
-    subscription.delete().catch(err => {
-      console.error(`Failed to delete subscription ${subscriptionName}:`, err);
-    });
+    subscription.delete().catch((err) =>
+      console.error(`Failed to delete subscription ${subscriptionName}:`, err)
+    );
     res.end();
   });
-  });
+});
 
 app.get('/api/sessions/:sessionId/files', async (req, res) => {
   const { sessionId } = req.params;
-
   try {
-    // Make sure the session exists
     const sessionRef = firestore.collection('quickdrop-sessions').doc(sessionId);
     const sessionSnap = await sessionRef.get();
-    if (!sessionSnap.exists) {
-      return res.status(404).json({ message: 'Session not found.' });
-    }
+    if (!sessionSnap.exists) return res.status(404).json({ message: 'Session not found.' });
 
-    // Load files subcollection, newest first
-    const filesSnap = await sessionRef
-      .collection('files')
-      .orderBy('createdAt', 'desc')
-      .get();
-
+    const filesSnap = await sessionRef.collection('files').orderBy('createdAt', 'desc').get();
     const files = filesSnap.docs.map((doc) => {
       const data = doc.data();
       return {
         id: doc.id,
         ...data,
-        // Firestore Timestamp -> ISO string for the React `new Date(...)` calls
-        createdAt: data.createdAt?.toDate
-          ? data.createdAt.toDate().toISOString()
-          : data.createdAt,
+        createdAt: data.createdAt?.toDate ? data.createdAt.toDate().toISOString() : data.createdAt,
       };
     });
-
     res.json({ files });
   } catch (err) {
     console.error('Error fetching session files:', err);
@@ -234,7 +183,57 @@ app.get('/api/sessions/:sessionId/files', async (req, res) => {
   }
 });
 
-// --- Start Server ---
+// End session: delete all GCS files, Firestore subcollection, and session doc
+app.delete('/api/sessions/:sessionId', async (req, res) => {
+  const { sessionId } = req.params;
+  try {
+    const sessionRef = firestore.collection('quickdrop-sessions').doc(sessionId);
+    const sessionSnap = await sessionRef.get();
+    if (!sessionSnap.exists) return res.status(404).json({ message: 'Session not found.' });
+
+    // Delete all GCS objects under this session
+    const [gcsFiles] = await bucket.getFiles({ prefix: `quickdrop-files/${sessionId}/` });
+    await Promise.all(gcsFiles.map((f) => f.delete().catch(() => null)));
+
+    // Delete Firestore files subcollection
+    const filesSnap = await sessionRef.collection('files').get();
+    const batch = firestore.batch();
+    filesSnap.docs.forEach((doc) => batch.delete(doc.ref));
+    await batch.commit();
+
+    // Delete session doc
+    await sessionRef.delete();
+
+    res.json({ message: 'Session ended and all files deleted.' });
+  } catch (err) {
+    console.error('Error ending session:', err);
+    res.status(500).json({ message: 'Failed to end session.' });
+  }
+});
+
+// Delete a single file from a session
+app.delete('/api/sessions/:sessionId/files/:fileId', async (req, res) => {
+  const { sessionId, fileId } = req.params;
+  try {
+    const fileRef = firestore
+      .collection('quickdrop-sessions')
+      .doc(sessionId)
+      .collection('files')
+      .doc(fileId);
+    const fileSnap = await fileRef.get();
+    if (!fileSnap.exists) return res.status(404).json({ message: 'File not found.' });
+
+    const { storagePath } = fileSnap.data();
+    await bucket.file(storagePath).delete().catch(() => null);
+    await fileRef.delete();
+
+    res.json({ message: 'File deleted.' });
+  } catch (err) {
+    console.error('Error deleting file:', err);
+    res.status(500).json({ message: 'Failed to delete file.' });
+  }
+});
+
 app.listen(PORT, () => {
-  console.log(`QuickDrop API server listening on port ${PORT}`);
+  console.log(`QuickDrop API listening on port ${PORT}`);
 });
