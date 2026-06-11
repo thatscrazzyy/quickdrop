@@ -1,6 +1,7 @@
 // quickdrop/src/App.jsx
 
 import React, { useState, useCallback, useEffect, useRef } from 'react';
+import JSZip from 'jszip';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8080';
 
@@ -30,6 +31,16 @@ const uploadFileWithProgress = (blob, uploadUrl, contentType, onProgress) =>
     xhr.onerror = () => reject(new Error('Upload failed: network error'));
     xhr.send(blob);
   });
+
+// Returns 'image' | 'video' | 'audio' | 'pdf' | null
+const getPreviewType = (mimeType) => {
+  if (!mimeType) return null;
+  if (mimeType.startsWith('image/')) return 'image';
+  if (mimeType.startsWith('video/')) return 'video';
+  if (mimeType.startsWith('audio/')) return 'audio';
+  if (mimeType === 'application/pdf') return 'pdf';
+  return null;
+};
 
 // --- Crypto ---
 
@@ -64,6 +75,18 @@ const decryptFileData = async (encryptedBlob, key, originalType) => {
   return new Blob([plain], { type: originalType || 'application/octet-stream' });
 };
 
+// Fetch a file from GCS and decrypt it if a key is available
+const fetchAndDecrypt = async (file, apiBase, encKey) => {
+  const resp = await fetch(
+    `${apiBase}/api/get-download-url?storagePath=${encodeURIComponent(file.storagePath)}`
+  );
+  if (!resp.ok) throw new Error('Could not get download link.');
+  const { downloadUrl } = await resp.json();
+  const raw = await fetch(downloadUrl);
+  const blob = await raw.blob();
+  return encKey ? decryptFileData(blob, encKey, file.type) : blob;
+};
+
 // --- Toast ---
 
 function ToastStack({ toasts, onDismiss }) {
@@ -93,6 +116,86 @@ function ToastStack({ toasts, onDismiss }) {
   );
 }
 
+// --- Preview Modal ---
+
+function PreviewModal({ file, previewUrl, loading, onClose }) {
+  // Close on Escape key
+  useEffect(() => {
+    const handler = (e) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [onClose]);
+
+  if (!file) return null;
+  const type = getPreviewType(file.type);
+
+  return (
+    <div
+      className="fixed inset-0 bg-black/85 z-50 flex items-center justify-center p-4"
+      onClick={onClose}
+    >
+      <div
+        className="relative w-full max-w-4xl max-h-[90vh] flex flex-col bg-gray-900 rounded-xl overflow-hidden shadow-2xl border border-gray-700"
+        onClick={(e) => e.stopPropagation()}
+      >
+        {/* Header */}
+        <div className="flex items-center justify-between px-4 py-3 border-b border-gray-700 flex-shrink-0">
+          <div className="min-w-0 mr-4">
+            <p className="font-medium text-gray-200 truncate">{file.name}</p>
+            <p className="text-xs text-gray-500">{formatBytes(file.size)}</p>
+          </div>
+          <button
+            onClick={onClose}
+            className="text-gray-400 hover:text-white transition-colors flex-shrink-0 p-1"
+            aria-label="Close preview"
+          >
+            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+            </svg>
+          </button>
+        </div>
+
+        {/* Content */}
+        <div className="flex-1 overflow-auto flex items-center justify-center p-4 min-h-0">
+          {loading ? (
+            <div className="flex flex-col items-center gap-3 text-gray-400 py-16">
+              <div className="w-8 h-8 border-2 border-cyan-500 border-t-transparent rounded-full animate-spin" />
+              <span className="text-sm">Decrypting {formatBytes(file.size)}…</span>
+            </div>
+          ) : !previewUrl ? (
+            <p className="text-gray-500 py-16">Preview unavailable.</p>
+          ) : type === 'image' ? (
+            <img
+              src={previewUrl}
+              alt={file.name}
+              className="max-w-full max-h-[70vh] object-contain rounded"
+            />
+          ) : type === 'video' ? (
+            <video
+              src={previewUrl}
+              controls
+              autoPlay
+              className="max-w-full max-h-[70vh] rounded"
+            />
+          ) : type === 'audio' ? (
+            <div className="w-full max-w-lg py-8">
+              <p className="text-gray-400 text-sm text-center mb-4">{file.name}</p>
+              <audio src={previewUrl} controls className="w-full" />
+            </div>
+          ) : type === 'pdf' ? (
+            <iframe
+              src={previewUrl}
+              title={file.name}
+              className="w-full rounded"
+              style={{ height: '70vh' }}
+            />
+          ) : null}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // --- App ---
 
 export default function App() {
@@ -108,6 +211,15 @@ export default function App() {
   const [expiresAt, setExpiresAt] = useState(null);
   const [timeLeft, setTimeLeft] = useState(null);
   const [deletingFiles, setDeletingFiles] = useState(new Set());
+
+  // Multi-select
+  const [selectedFiles, setSelectedFiles] = useState(new Set());
+  const [isZipping, setIsZipping] = useState(false);
+
+  // Preview
+  const [previewFile, setPreviewFile] = useState(null);
+  const [previewUrl, setPreviewUrl] = useState(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
 
   const reconnectAttemptsRef = useRef(0);
   const reconnectTimerRef = useRef(null);
@@ -154,7 +266,6 @@ export default function App() {
             window.history.replaceState({}, '', window.location.pathname);
           }
         } catch {
-          // Network failure — try anyway
           setSessionId(urlSession.trim());
           setJoinInput(urlSession.trim());
         }
@@ -165,16 +276,10 @@ export default function App() {
 
   // Session expiry countdown
   useEffect(() => {
-    if (!expiresAt) {
-      setTimeLeft(null);
-      return;
-    }
+    if (!expiresAt) { setTimeLeft(null); return; }
     const tick = () => {
       const diff = new Date(expiresAt) - Date.now();
-      if (diff <= 0) {
-        setTimeLeft('Expired');
-        return;
-      }
+      if (diff <= 0) { setTimeLeft('Expired'); return; }
       const m = Math.floor(diff / 60000);
       const s = Math.floor((diff % 60000) / 1000);
       setTimeLeft(`${m}m ${String(s).padStart(2, '0')}s`);
@@ -184,12 +289,11 @@ export default function App() {
     return () => clearInterval(id);
   }, [expiresAt]);
 
-  // SSE connection
+  // SSE connection with auto-reconnect
   const connectSSE = useCallback(() => {
     if (!sessionId) return;
     const es = new EventSource(`${API_BASE_URL}/api/sessions/${sessionId}/subscribe`);
     eventSourceRef.current = es;
-
     es.onmessage = (event) => {
       try {
         const fileData = JSON.parse(event.data);
@@ -203,7 +307,6 @@ export default function App() {
         console.error('Failed to parse SSE message');
       }
     };
-
     es.onerror = () => {
       es.close();
       const attempts = reconnectAttemptsRef.current;
@@ -219,10 +322,7 @@ export default function App() {
 
   // Load files + open SSE on session join
   useEffect(() => {
-    if (!sessionId) {
-      setFiles([]);
-      return;
-    }
+    if (!sessionId) { setFiles([]); return; }
     reconnectAttemptsRef.current = 0;
     clearTimeout(reconnectTimerRef.current);
     if (eventSourceRef.current) eventSourceRef.current.close();
@@ -235,24 +335,16 @@ export default function App() {
           const combined = [...data.files, ...prev];
           const seen = new Set();
           return combined
-            .filter((f) => {
-              if (seen.has(f.id)) return false;
-              seen.add(f.id);
-              return true;
-            })
+            .filter((f) => { if (seen.has(f.id)) return false; seen.add(f.id); return true; })
             .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
         });
       })
       .catch(console.error);
 
     connectSSE();
-
     return () => {
       clearTimeout(reconnectTimerRef.current);
-      if (eventSourceRef.current) {
-        eventSourceRef.current.close();
-        eventSourceRef.current = null;
-      }
+      if (eventSourceRef.current) { eventSourceRef.current.close(); eventSourceRef.current = null; }
     };
   }, [sessionId, connectSSE]);
 
@@ -312,10 +404,7 @@ export default function App() {
 
   const clearSession = () => {
     clearTimeout(reconnectTimerRef.current);
-    if (eventSourceRef.current) {
-      eventSourceRef.current.close();
-      eventSourceRef.current = null;
-    }
+    if (eventSourceRef.current) { eventSourceRef.current.close(); eventSourceRef.current = null; }
     setSessionId(null);
     setJoinInput('');
     setEncKey(null);
@@ -323,6 +412,8 @@ export default function App() {
     setExpiresAt(null);
     setUploadingFiles({});
     setFiles([]);
+    setSelectedFiles(new Set());
+    closePreview();
   };
 
   const handleLeaveSession = () => clearSession();
@@ -348,14 +439,11 @@ export default function App() {
       );
       if (!resp.ok) throw new Error('Failed to delete file.');
       setFiles((prev) => prev.filter((f) => f.id !== file.id));
+      setSelectedFiles((prev) => { const next = new Set(prev); next.delete(file.id); return next; });
     } catch (err) {
       addToast(err.message, 'error');
     } finally {
-      setDeletingFiles((prev) => {
-        const next = new Set(prev);
-        next.delete(file.id);
-        return next;
-      });
+      setDeletingFiles((prev) => { const next = new Set(prev); next.delete(file.id); return next; });
     }
   };
 
@@ -363,17 +451,11 @@ export default function App() {
 
   const handleFileUpload = useCallback(
     async (droppedFiles) => {
-      if (!sessionId) {
-        addToast('Not in a session.', 'error');
-        return;
-      }
+      if (!sessionId) { addToast('Not in a session.', 'error'); return; }
       const MAX_SIZE = 100 * 1024 * 1024;
 
       for (const file of droppedFiles) {
-        if (file.size > MAX_SIZE) {
-          addToast(`${file.name} exceeds 100MB limit.`, 'error');
-          continue;
-        }
+        if (file.size > MAX_SIZE) { addToast(`${file.name} exceeds 100MB limit.`, 'error'); continue; }
 
         const uid = `${Date.now()}-${file.name}`;
         setUploadingFiles((prev) => ({ ...prev, [uid]: 0 }));
@@ -384,41 +466,24 @@ export default function App() {
           const urlResp = await fetch(`${API_BASE_URL}/api/get-upload-url`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              sessionId,
-              fileName: file.name,
-              fileType: file.type,
-              fileSize: file.size,
-            }),
+            body: JSON.stringify({ sessionId, fileName: file.name, fileType: file.type, fileSize: file.size }),
           });
-
           if (!urlResp.ok) {
             const err = await urlResp.json().catch(() => ({}));
             throw new Error(err.message || 'Failed to get upload URL.');
           }
-
           const { uploadUrl } = await urlResp.json();
 
           await uploadFileWithProgress(uploadBlob, uploadUrl, file.type, (p) =>
             setUploadingFiles((prev) => ({ ...prev, [uid]: p }))
           );
 
-          setTimeout(
-            () =>
-              setUploadingFiles((prev) => {
-                const next = { ...prev };
-                delete next[uid];
-                return next;
-              }),
-            500
+          setTimeout(() =>
+            setUploadingFiles((prev) => { const next = { ...prev }; delete next[uid]; return next; }), 500
           );
         } catch (err) {
           addToast(`Upload failed for ${file.name}: ${err.message}`, 'error');
-          setUploadingFiles((prev) => {
-            const next = { ...prev };
-            delete next[uid];
-            return next;
-          });
+          setUploadingFiles((prev) => { const next = { ...prev }; delete next[uid]; return next; });
         }
       }
     },
@@ -429,34 +494,74 @@ export default function App() {
 
   const handleDownload = async (file) => {
     try {
-      const resp = await fetch(
-        `${API_BASE_URL}/api/get-download-url?storagePath=${encodeURIComponent(file.storagePath)}`
-      );
-      if (!resp.ok) throw new Error('Could not get download link.');
-      const { downloadUrl } = await resp.json();
-
-      if (encKey) {
-        const raw = await fetch(downloadUrl);
-        const blob = await raw.blob();
-        const decrypted = await decryptFileData(blob, encKey, file.type);
-        const url = URL.createObjectURL(decrypted);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = file.name || 'download';
-        a.click();
-        URL.revokeObjectURL(url);
-      } else {
-        const a = document.createElement('a');
-        a.href = downloadUrl;
-        a.download = file.name || 'download';
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-      }
+      const blob = await fetchAndDecrypt(file, API_BASE_URL, encKey);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = file.name || 'download';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
     } catch (err) {
       addToast(`Download failed: ${err.message}`, 'error');
     }
   };
+
+  // --- ZIP Download ---
+
+  const handleZipDownload = async (targetFiles) => {
+    if (targetFiles.length === 0) return;
+    setIsZipping(true);
+    addToast(`Preparing ZIP for ${targetFiles.length} file${targetFiles.length > 1 ? 's' : ''}…`, 'info');
+    const zip = new JSZip();
+    try {
+      await Promise.all(
+        targetFiles.map(async (file) => {
+          const blob = await fetchAndDecrypt(file, API_BASE_URL, encKey);
+          zip.file(file.name, await blob.arrayBuffer());
+        })
+      );
+      const content = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 6 } });
+      const url = URL.createObjectURL(content);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'quickdrop-files.zip';
+      a.click();
+      URL.revokeObjectURL(url);
+      setSelectedFiles(new Set());
+    } catch (err) {
+      addToast(`ZIP download failed: ${err.message}`, 'error');
+    } finally {
+      setIsZipping(false);
+    }
+  };
+
+  // --- Preview ---
+
+  const openPreview = async (file) => {
+    setPreviewFile(file);
+    setPreviewUrl(null);
+    setPreviewLoading(true);
+    try {
+      const blob = await fetchAndDecrypt(file, API_BASE_URL, encKey);
+      setPreviewUrl(URL.createObjectURL(blob));
+    } catch (err) {
+      addToast(`Preview failed: ${err.message}`, 'error');
+      setPreviewFile(null);
+    } finally {
+      setPreviewLoading(false);
+    }
+  };
+
+  const closePreview = () => {
+    if (previewUrl) URL.revokeObjectURL(previewUrl);
+    setPreviewFile(null);
+    setPreviewUrl(null);
+    setPreviewLoading(false);
+  };
+
+  // --- Copy link ---
 
   const handleCopyLink = async () => {
     const url = sessionId
@@ -471,6 +576,7 @@ export default function App() {
   };
 
   // --- Drag handlers ---
+
   const handleDragOver = (e) => { e.preventDefault(); setIsDragging(true); };
   const handleDragLeave = (e) => { e.preventDefault(); setIsDragging(false); };
   const handleDrop = (e) => {
@@ -482,17 +588,39 @@ export default function App() {
     }
   };
 
+  // --- Selection helpers ---
+
+  const allSelected = files.length > 0 && files.every((f) => selectedFiles.has(f.id));
+  const toggleSelectAll = () =>
+    setSelectedFiles(allSelected ? new Set() : new Set(files.map((f) => f.id)));
+  const toggleSelect = (id) =>
+    setSelectedFiles((prev) => {
+      const next = new Set(prev);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
+
   const sessionUrl = sessionId
     ? `${window.location.origin}?session=${encodeURIComponent(sessionId)}${encKeyB64 ? `#k=${encKeyB64}` : ''}`
     : '';
 
   const uploadingList = Object.entries(uploadingFiles);
+  const selectedList = files.filter((f) => selectedFiles.has(f.id));
 
   // --- Render ---
 
   return (
     <div className="flex flex-col min-h-screen bg-gray-900 text-gray-100 font-sans p-4 md:p-8">
       <ToastStack toasts={toasts} onDismiss={dismissToast} />
+
+      {previewFile && (
+        <PreviewModal
+          file={previewFile}
+          previewUrl={previewUrl}
+          loading={previewLoading}
+          onClose={closePreview}
+        />
+      )}
 
       <header className="w-full max-w-5xl mx-auto mb-6">
         <h1 className="text-4xl font-bold text-center text-white">
@@ -550,9 +678,7 @@ export default function App() {
             <div className="min-w-0">
               <div className="flex items-center gap-2 flex-wrap">
                 <span className="text-gray-400 text-sm">Session:</span>
-                <strong className="text-xl text-cyan-400 font-mono tracking-widest">
-                  {sessionId}
-                </strong>
+                <strong className="text-xl text-cyan-400 font-mono tracking-widest">{sessionId}</strong>
                 {encKey ? (
                   <span className="text-xs bg-green-900 text-green-300 px-2 py-0.5 rounded-full border border-green-700">
                     E2E Encrypted
@@ -628,18 +754,8 @@ export default function App() {
               className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
               aria-label="File upload"
             />
-            <svg
-              className="w-14 h-14 text-gray-500 mb-3"
-              fill="none"
-              stroke="currentColor"
-              viewBox="0 0 24 24"
-            >
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                strokeWidth={2}
-                d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"
-              />
+            <svg className="w-14 h-14 text-gray-500 mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
             </svg>
             <p className="text-xl text-gray-300">Drag & drop files here</p>
             <p className="text-gray-400">or click to select</p>
@@ -654,9 +770,7 @@ export default function App() {
                 {uploadingList.map(([uid, progress]) => (
                   <div key={uid}>
                     <div className="flex justify-between text-sm text-gray-300 mb-1">
-                      <span className="truncate w-11/12">
-                        {uid.replace(/^\d+-/, '')}
-                      </span>
+                      <span className="truncate w-11/12">{uid.replace(/^\d+-/, '')}</span>
                       <span>{Math.round(progress)}%</span>
                     </div>
                     <div className="w-full bg-gray-600 rounded-full h-2">
@@ -673,50 +787,115 @@ export default function App() {
 
           {/* File list */}
           <div className="flex-grow mt-6">
-            <h3 className="text-xl font-semibold mb-4 text-gray-300">Shared Files</h3>
-            <div className="space-y-3">
-              {files.length === 0 && uploadingList.length === 0 && (
-                <p className="text-gray-500 text-center py-10">
-                  No files yet — upload one above!
-                </p>
-              )}
-              {files.map((file) => (
-                <div
-                  key={file.id}
-                  className="flex items-center justify-between p-4 bg-gray-800 rounded-lg border border-gray-700"
+            <div className="flex items-center justify-between mb-4">
+              <div className="flex items-center gap-3">
+                <h3 className="text-xl font-semibold text-gray-300">Shared Files</h3>
+                {files.length > 0 && (
+                  <button
+                    onClick={toggleSelectAll}
+                    className="text-xs text-gray-400 hover:text-cyan-400 transition-colors"
+                  >
+                    {allSelected ? 'Deselect All' : 'Select All'}
+                  </button>
+                )}
+              </div>
+
+              {files.length > 0 && (
+                <button
+                  onClick={() =>
+                    selectedList.length > 0
+                      ? handleZipDownload(selectedList)
+                      : handleZipDownload(files)
+                  }
+                  disabled={isZipping}
+                  className="flex items-center gap-1.5 px-3 py-2 bg-gray-700 hover:bg-gray-600 disabled:opacity-50 text-white font-semibold rounded-lg text-sm transition-colors border border-gray-600"
                 >
-                  <div className="flex-1 min-w-0 mr-3">
-                    <p className="font-medium text-cyan-300 truncate">{file.name}</p>
-                    <p className="text-sm text-gray-400">
-                      {formatBytes(file.size)}
-                      {file.type ? ` · ${file.type}` : ''}
-                    </p>
-                  </div>
-                  <div className="flex items-center gap-2 flex-shrink-0">
-                    <button
-                      onClick={() => handleDownload(file)}
-                      className="px-3 py-2 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-lg text-sm transition-colors"
-                    >
-                      Download
-                    </button>
-                    <button
-                      onClick={() => handleDeleteFile(file)}
-                      disabled={deletingFiles.has(file.id)}
-                      className="p-2 text-gray-500 hover:text-red-400 disabled:opacity-40 rounded-lg hover:bg-gray-700 transition-colors"
-                      title="Delete file"
-                      aria-label="Delete file"
-                    >
-                      {deletingFiles.has(file.id) ? (
-                        <span className="text-xs">…</span>
-                      ) : (
-                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                        </svg>
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                  </svg>
+                  {isZipping
+                    ? 'Zipping…'
+                    : selectedList.length > 0
+                    ? `Download ZIP (${selectedList.length})`
+                    : 'Download All as ZIP'}
+                </button>
+              )}
+            </div>
+
+            <div className="space-y-2">
+              {files.length === 0 && uploadingList.length === 0 && (
+                <p className="text-gray-500 text-center py-10">No files yet — upload one above!</p>
+              )}
+              {files.map((file) => {
+                const canPreview = !!getPreviewType(file.type);
+                const isSelected = selectedFiles.has(file.id);
+                return (
+                  <div
+                    key={file.id}
+                    className={`flex items-center gap-3 p-3 rounded-lg border transition-colors ${
+                      isSelected
+                        ? 'bg-gray-700 border-cyan-700'
+                        : 'bg-gray-800 border-gray-700 hover:border-gray-600'
+                    }`}
+                  >
+                    {/* Checkbox */}
+                    <input
+                      type="checkbox"
+                      checked={isSelected}
+                      onChange={() => toggleSelect(file.id)}
+                      className="w-4 h-4 accent-cyan-500 flex-shrink-0 cursor-pointer"
+                      aria-label={`Select ${file.name}`}
+                    />
+
+                    {/* File info */}
+                    <div className="flex-1 min-w-0">
+                      <p className="font-medium text-cyan-300 truncate">{file.name}</p>
+                      <p className="text-sm text-gray-400">
+                        {formatBytes(file.size)}
+                        {file.type ? ` · ${file.type}` : ''}
+                      </p>
+                    </div>
+
+                    {/* Actions */}
+                    <div className="flex items-center gap-1.5 flex-shrink-0">
+                      {canPreview && (
+                        <button
+                          onClick={() => openPreview(file)}
+                          className="p-2 text-gray-400 hover:text-cyan-400 rounded-lg hover:bg-gray-700 transition-colors"
+                          title="Preview"
+                          aria-label="Preview file"
+                        >
+                          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
+                          </svg>
+                        </button>
                       )}
-                    </button>
+                      <button
+                        onClick={() => handleDownload(file)}
+                        className="px-3 py-2 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-lg text-sm transition-colors"
+                      >
+                        Download
+                      </button>
+                      <button
+                        onClick={() => handleDeleteFile(file)}
+                        disabled={deletingFiles.has(file.id)}
+                        className="p-2 text-gray-500 hover:text-red-400 disabled:opacity-40 rounded-lg hover:bg-gray-700 transition-colors"
+                        title="Delete file"
+                        aria-label="Delete file"
+                      >
+                        {deletingFiles.has(file.id) ? (
+                          <span className="text-xs w-4 h-4 flex items-center justify-center">…</span>
+                        ) : (
+                          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                          </svg>
+                        )}
+                      </button>
+                    </div>
                   </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           </div>
         </div>
